@@ -1,150 +1,80 @@
 import time
 import random
-import numpy as np
-import matplotlib.pyplot as plt
-from pyspark.ml.tuning import CrossValidator
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 
 class GeneticAlgorithm:
-    """
-    A class implementing a Genetic Algorithm for hyperparameter optimization of PySpark machine learning models.
-
-    Attributes:
-        estimator (object): The PySpark MLlib estimator (e.g., Regression, Classifier) to optimize.
-        parameters_ranges (dict): A dictionary containing parameter names as keys and their possible values as lists.
-        train_data (DataFrame): Training data as a PySpark DataFrame.
-        evaluator (object): PySpark evaluator for model evaluation (e.g., RegressionEvaluator).
-        size_of_population (int): The number of chromosomes (individuals) in the population.
-        fitness_limit (float): The target fitness value to stop the algorithm.
-        time_limit (float): The maximum runtime for the algorithm in minutes.
-        probability (float): Probability of mutation for each gene.
-        mutation_number (int): Number of mutations per chromosome.
-    """
-
-    def __init__(self, estimator, evaluator, parameters_ranges, train_data, size_of_population, 
-                 fitness_limit, time_limit, probability=0.1, mutation_number=1):
-        """
-        Initializes the GeneticAlgorithm class with the given parameters.
-        """
-        self.estimator = estimator
-        self.parameters_ranges = parameters_ranges
-        self.train_data = train_data
+    def __init__(self, pipeline, evaluator, parameters_ranges, train_data, size_of_population,
+                 score_limit, time_limit, probability=0.1, mutation_number=1, num_folds=5):
+        self.pipeline = pipeline.copy()
         self.evaluator = evaluator
+        self.parameters_ranges = parameters_ranges
+        self.train_data = train_data.cache()  # Cache data for repeated use
         self.size_of_population = size_of_population
+        self.fitness_limit = score_limit
+        self.time_limit = time_limit * 60  # Convert to seconds
         self.probability = probability
         self.mutation_number = mutation_number
-        self.fitness_limit = fitness_limit
-        self.time_limit = time_limit
-        self.scores = []  # Tracks the best score per generation
-        self.mean_scores = []  # Tracks the mean score per generation
-        self.cached_fitness = {}  # Caches fitness evaluations for chromosomes
+        self.num_folds = num_folds
+        self.crossval = self._initialize_crossvalidator()
+        self.scores = []  # Tracks the best scores per generation
+        self.best_solution = None
 
-    def get_scores(self):
-        """
-        Returns the list of best scores per generation.
-        """
-        return self.scores
-
-    def get_mean_scores(self):
-        """
-        Returns the list of mean scores per generation.
-        """
-        return self.mean_scores
+    def _initialize_crossvalidator(self):
+        param_grid = ParamGridBuilder().build()
+        return CrossValidator(
+            estimator=self.pipeline,
+            evaluator=self.evaluator,
+            numFolds=self.num_folds,
+            estimatorParamMaps=param_grid
+        )
 
     def generate_chromosome(self):
-        """
-        Generates a random chromosome (individual) with parameters sampled from their ranges.
-        """
+        """Generates a random chromosome."""
         return {key: random.choice(values) for key, values in self.parameters_ranges.items()}
 
     def generate_population(self):
-        """
-        Generates the initial population of chromosomes.
-        """
+        """Generates the initial population."""
         return [self.generate_chromosome() for _ in range(self.size_of_population)]
 
     def fitness_function(self, chromosome):
         """
-        Evaluates the fitness of a chromosome by performing cross-validation on the estimator.
-
-        Args:
-            chromosome (dict): A dictionary representing parameter values for the estimator.
-
-        Returns:
-            float: The mean cross-validation score.
+        Evaluate the fitness of a chromosome by setting its parameters
+        and evaluating the model using cross-validation.
         """
-        chromosome_tuple = tuple(chromosome.items())
-        if chromosome_tuple not in self.cached_fitness:
-            self.estimator(**chromosome)
-            score = cross_val_score(self.estimator, self.X_train, self.y_train, 
-                                    cv=KFold(5, shuffle=True, random_state=3)).mean()
-            self.cached_fitness[chromosome_tuple] = score
-        return self.cached_fitness[chromosome_tuple]
+        try:
+            estimator = self.pipeline.getStages()[-1]
+            estimator.setParams(**chromosome)
+            self.pipeline.setStages(self.pipeline.getStages()[:-1] + [estimator])
+            cv_model = self.crossval.fit(self.train_data)
+            return self.evaluator.evaluate(cv_model.bestModel.transform(self.train_data))
+        except Exception as e:
+            logging.error(f"Error in fitness function for chromosome {chromosome}: {e}")
+            return float("-inf")
 
-    def mean_score_population(self, population):
-        """
-        Calculates the mean fitness score of the population.
+    def evaluate_population_parallel(self, population):
+        """Evaluates the population in parallel to speed up computations."""
+        with ThreadPoolExecutor(max_workers=4) as executor:  # Adjust based on available resources
+            results = list(executor.map(self.fitness_function, population))
+        return sorted(zip(population, results), key=lambda x: x[1], reverse=True)
 
-        Args:
-            population (list): A list of chromosomes.
-
-        Returns:
-            float: The mean fitness score of the population.
-        """
-        return np.mean([self.fitness_function(chromosome) for chromosome in population])
-
-    def sort_population(self, population):
-        """
-        Sorts the population by fitness in descending order.
-
-        Args:
-            population (list): A list of chromosomes.
-
-        Returns:
-            list: The sorted population.
-        """
-        return sorted(population, key=self.fitness_function, reverse=True)
-
-    def selection_pair(self, population):
-        """
-        Selects the top two chromosomes from the population.
-
-        Args:
-            population (list): A list of chromosomes.
-
-        Returns:
-            tuple: The two selected chromosomes.
-        """
-        sorted_population = self.sort_population(population)
-        return sorted_population[:2]
+    def select_parents(self, population):
+        """Selects the top N individuals as parents."""
+        return [chrom for chrom, _ in population[:2]]  # Top 2 individuals
 
     def uniform_crossover(self, parent1, parent2):
-        """
-        Performs uniform crossover between two parent chromosomes.
-
-        Args:
-            parent1 (dict): The first parent chromosome.
-            parent2 (dict): The second parent chromosome.
-
-        Returns:
-            tuple: Two offspring chromosomes.
-        """
+        """Performs uniform crossover between two parents."""
         child1, child2 = parent1.copy(), parent2.copy()
         for param in self.parameters_ranges.keys():
             if random.random() < 0.5:
                 child1[param], child2[param] = child2[param], child1[param]
         return child1, child2
 
-    def mutation(self, chromosome):
-        """
-        Applies mutation to a chromosome by randomly changing its parameters.
-
-        Args:
-            chromosome (dict): The chromosome to mutate.
-
-        Returns:
-            dict: The mutated chromosome.
-        """
+    def mutate(self, chromosome):
+        """Mutates a chromosome by randomly changing its genes."""
         mutant = chromosome.copy()
         for _ in range(self.mutation_number):
             if random.random() < self.probability:
@@ -152,46 +82,46 @@ class GeneticAlgorithm:
                 mutant[param] = random.choice(self.parameters_ranges[param])
         return mutant
 
-    def plot_generations_scores(self):
-        """
-        Plots the best scores per generation to visualize the optimization process.
-        """
-        plt.figure(figsize=(15, 10))
-        plt.plot(self.scores, label='Max score per generation', color='seagreen')
-        plt.xlabel('Generation')
-        plt.ylabel('5-Fold CV Score')
-        plt.legend()
-        plt.show()
-
-    def evolution(self):
-        """
-        Runs the genetic algorithm to optimize the estimator's hyperparameters.
-
-        Returns:
-            list: The final sorted population after optimization.
-        """
-        start_time = time.time()
+    def run(self):
+        """Runs the genetic algorithm to optimize hyperparameters."""
+        logging.info("Starting Genetic Algorithm...")
         population = self.generate_population()
-        population = self.sort_population(population)
+        start_time = time.time()
+        generation = 0
 
-        while (time.time() - start_time < self.time_limit * 60 and 
-               self.fitness_function(population[0]) < self.fitness_limit):
-            # Selection
-            parent1, parent2 = self.selection_pair(population)
-
-            # Crossover
-            offspring1, offspring2 = self.uniform_crossover(parent1, parent2)
-
-            # Mutation
-            offspring1 = self.mutation(offspring1)
-            offspring2 = self.mutation(offspring2)
-
-            # Next generation
-            population = self.sort_population(population[:self.size_of_population - 2] + [offspring1, offspring2])
-
-            # Track scores
-            best_score = self.fitness_function(population[0])
+        while time.time() - start_time < self.time_limit:
+            logging.info(f"Generation {generation} - Evaluating population...")
+            population_with_scores = self.evaluate_population_parallel(population)
+            best_chromosome, best_score = population_with_scores[0]
             self.scores.append(best_score)
-            self.mean_scores.append(self.mean_score_population(population))
 
-        return population
+            logging.info(f"Generation {generation} - Best score: {best_score:.4f}")
+
+            # Update the best solution
+            if self.best_solution is None or best_score > self.best_solution[1]:
+                self.best_solution = (best_chromosome, best_score)
+
+            # Check termination criteria
+            if best_score >= self.fitness_limit:
+                logging.info(f"Fitness limit reached: {best_score:.4f}")
+                break
+
+            # Selection
+            parents = self.select_parents(population_with_scores)
+
+            # Crossover and Mutation
+            offspring = []
+            for _ in range(self.size_of_population // 2):  # Create pairs of offspring
+                child1, child2 = self.uniform_crossover(parents[0], parents[1])
+                offspring.append(self.mutate(child1))
+                offspring.append(self.mutate(child2))
+
+            # Elitism: Preserve top N parents
+            elite = [chrom for chrom, _ in population_with_scores[:len(parents)]]
+            population = elite + offspring
+
+            generation += 1
+
+        logging.info(f"Genetic Algorithm completed in {time.time() - start_time:.2f} seconds.")
+        logging.info(f"Best fitness achieved: {self.best_solution[1]:.4f}")
+        return self.best_solution[0]
