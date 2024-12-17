@@ -1,8 +1,11 @@
+import os
 import time
 import random
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from pyspark.ml import Pipeline
 from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.sql import DataFrame
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 
@@ -22,6 +25,9 @@ class GeneticAlgorithm:
         self.crossval = self._initialize_crossvalidator()
         self.scores = []  # Tracks the best scores per generation
         self.best_solution = None
+
+    def get_scores(self):
+        return self.scores
 
     def _initialize_crossvalidator(self):
         param_grid = ParamGridBuilder().build()
@@ -57,7 +63,7 @@ class GeneticAlgorithm:
 
     def evaluate_population_parallel(self, population):
         """Evaluates the population in parallel to speed up computations."""
-        with ThreadPoolExecutor(max_workers=4) as executor:  # Adjust based on available resources
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:  # Adjust based on available resources
             results = list(executor.map(self.fitness_function, population))
         return sorted(zip(population, results), key=lambda x: x[1], reverse=True)
 
@@ -122,6 +128,6 @@ class GeneticAlgorithm:
 
             generation += 1
 
-        logging.info(f"Genetic Algorithm completed in {time.time() - start_time:.2f} seconds.")
+        logging.info(f"Genetic Algorithm completed in {(time.time() - start_time) / 60:.2f} minutes.")
         logging.info(f"Best fitness achieved: {self.best_solution[1]:.4f}")
         return self.best_solution[0]
