@@ -1,10 +1,10 @@
-from sklearn.metrics import roc_auc_score, roc_curve, classification_report
-from pyspark.ml.evaluation import BinaryClassificationEvaluator
-import matplotlib.pyplot as plt
-import seaborn as sns
 import pandas as pd
+import seaborn as sns
 from tqdm import tqdm
-
+import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from sklearn.metrics import roc_auc_score, roc_curve, classification_report
 
 def plot_roc_curve(test_target, y_prob):
     """
@@ -67,67 +67,81 @@ def plot_feature_importance(feature_importances, columns, figsize=(10, 6), param
     plt.show()
 
 
-def evaluate_model(model, test_data, model_name):
+
+def evaluate_model(model, test_data, model_name, label_col='is_fraud', prediction_col='prediction'):
     """
     Evaluates a given model on the test dataset and returns both the ROC score and classification report.
     
     Args:
         model (object): The trained Spark model to evaluate.
         test_data (DataFrame): The test dataset.
-        model_name (str): The name of the model for reporting.
+        label_col (str): The label column name.
+        prediction_col (str): The prediction column name.
     
     Returns:
-        tuple: A tuple containing the ROC score, classification report, and test scores as pandas DataFrame.
+        dict: A dictionary containing the ROC score, classification report, and test scores as a pandas DataFrame.
     """
-    # Apply the model to the test data
-    transformed_test = model.transform(test_data)
-    test_scores = transformed_test.select('is_fraud', 'prediction').toPandas()
+    try:
+        # Apply the model to the test data and cache the result
+        transformed_test = model.transform(test_data).cache()
+        
+        # Extract relevant columns and convert to Pandas DataFrame for sklearn evaluation
+        test_scores = transformed_test.select(label_col, prediction_col).toPandas()
 
-    # Generate the classification report
-    class_report = classification_report(
-        y_true=test_scores['is_fraud'],
-        y_pred=test_scores['prediction'],
-        zero_division=1 if model_name == 'RandomForest' else 'warn'
-    )
+        # Generate the classification report
+        y_true = test_scores[label_col].tolist()
+        y_pred = test_scores[prediction_col].tolist()
+        
+        class_report = classification_report(y_true, y_pred, zero_division=1 if model_name == 'RandomForest' else 'warn')
 
-    # Calculate the ROC score
-    evaluator = BinaryClassificationEvaluator(labelCol='is_fraud', metricName='areaUnderROC')
-    roc = evaluator.evaluate(transformed_test)
+        # Calculate the ROC score using Spark evaluator
+        evaluator = BinaryClassificationEvaluator(labelCol=label_col, rawPredictionCol=prediction_col, metricName='areaUnderROC')
+        roc = evaluator.evaluate(transformed_test)
 
-    return roc, class_report, test_scores
+        return {'roc': roc, 'classification_report': class_report, 'test_scores': test_scores}
+    
+    except Exception as e:
+        raise RuntimeError(f"Error during model evaluation for {model_name}: {e}")
 
-
-def generate_model_results(trained_models, test_data):
+def generate_model_results(trained_models, test_data, max_workers=4):
     """
-    Evaluates all trained models and generates ROC scores and classification reports.
+    Evaluates all trained models and generates ROC scores and classification reports using threading.
     
     Args:
         trained_models (dict): A dictionary of trained models (model names as keys, models as values).
         test_data (DataFrame): The test dataset to evaluate the models on.
+        max_workers (int): The maximum number of threads to use.
     
     Returns:
         list: A list of dictionaries containing the results for each model.
     """
     model_results = []
-
-    # Loop through each trained model
-    for model_name, model in tqdm(trained_models.items(), desc='Generating models results'):
-        # Evaluate the current model
-        roc, class_report, test_scores = evaluate_model(model, test_data, model_name)
-
-        # Store the evaluation results
-        model_results.append({
-            'model_name': model_name,
-            'roc': roc,
-            'classification_report': class_report,
-            'test_scores': test_scores
-        })
-
-        # Print the results for this model
-        print(f"\nArea under ROC curve for {model_name}: {roc:.4f}\n")
-        print(f'\nClassification report for {model_name}: \n{class_report}')
-
+    
+    def evaluate_model_thread(model_name, model):
+        result = evaluate_model(model, test_data, model_name)
+        return model_name, result
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(evaluate_model_thread, model_name, model): model_name for model_name, model in trained_models.items()}
+        
+        for future in tqdm(as_completed(futures), total=len(futures), desc='Generating model results'):
+            model_name = futures[future]
+            try:
+                model_name, result = future.result()
+                model_results.append({
+                    'model_name': model_name,
+                    'roc': result['roc'],
+                    'classification_report': result['classification_report']
+                })
+                
+                # Print the results for this model
+                print(f"\nArea under ROC curve for {model_name}: {result['roc']:.4f}\n")
+                print(f'\nClassification report for {model_name}: \n{result["classification_report"]}')
+            except Exception as e:
+                print(f"Failed to evaluate model {model_name}: {e}")
+    
     return model_results
+
 
 
 def plot_all_roc_curves(model_results):
