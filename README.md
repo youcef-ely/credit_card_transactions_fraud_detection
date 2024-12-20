@@ -1,4 +1,4 @@
-# Data Science Project: Comprehensive Workflow
+# Credit Card Transactions Fraud Detection
 
 This repository contains a complete data science project workflow, covering data preprocessing, exploratory data analysis, and model development. The project demonstrates a structured approach to solving a data-driven problem and employs state-of-the-art techniques and tools.
 
